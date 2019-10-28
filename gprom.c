@@ -1,10 +1,17 @@
 #include <stdio.h>
 #include "postgres.h"
-#include "utils/builtins.h"
+#include "access/tableam.h"
+#include "access/relation.h"
 #include "catalog/pg_type.h"
+#include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "executor/tuptable.h"
 #include "fmgr.h"
+#include "funcapi.h"
+#include "utils/builtins.h"
+#include "utils/regproc.h"
+#include "utils/snapmgr.h"
 
 #define AUDIT_LOG_TABLE "audit_log"
 
@@ -17,12 +24,10 @@ PG_MODULE_MAGIC;
 
 /* Function Pointers for Hooks */
 
-static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
-static SPIPlanPtr plan = NULL;
+static SPIPlanPtr al_plan = NULL; // Keeps SPI plan around to optimize audit log insertion
 
 /* Audit Logging Functionality */
-
 static void
 gprom_ExecutorEnd(QueryDesc *queryDesc)
 {
@@ -30,15 +35,15 @@ gprom_ExecutorEnd(QueryDesc *queryDesc)
     if (strcmp(tbl, AUDIT_LOG_TABLE))
     {
         SPI_connect(); // Reuse connection?
-        if(!plan)
+        if(!al_plan)
         {
-            plan = SPI_prepare(INSERT_AL_QUERY, AL_QUERY_NARGS, AL_QUERY_OIDS);
-            SPI_keepplan(plan);
+            al_plan = SPI_prepare(INSERT_AL_QUERY, AL_QUERY_NARGS, AL_QUERY_OIDS);
+            SPI_keepplan(al_plan);
         }
-        SPI_execute_plan(plan, AL_QUERY_DATA(queryDesc->snapshot, queryDesc->sourceText), NULL, false, 0);
+        SPI_execute_plan(al_plan, AL_QUERY_DATA(queryDesc->snapshot, queryDesc->sourceText), NULL, false, 0);
         SPI_finish();
     }
-    
+
     // Hand control to prev/standard ExecutorEnd
     if (prev_ExecutorEnd)
         prev_ExecutorEnd(queryDesc);
@@ -48,57 +53,71 @@ gprom_ExecutorEnd(QueryDesc *queryDesc)
 
 /* Snapshot-Specific Table Scan */
 
-// This is a dummy function that the hook will check the query for, and if it is in the query,
-// set the table scan snapshot to the argument in this function.
-Datum 
+typedef struct snapshot_ctx_t {
+    TableScanDesc scandesc;
+} snapshot_ctx_t;
+
+// SRF to run table scan
+Datum
 snapshot(PG_FUNCTION_ARGS)
 {
-    int s = PG_GETARG_INT32(0);
-    return Int32GetDatum(s);
+    FuncCallContext *funcctx;
+
+    if(SRF_IS_FIRSTCALL())
+    {
+        funcctx = SRF_FIRSTCALL_INIT();
+        MemoryContext oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+        funcctx->user_fctx = palloc(sizeof(snapshot_ctx_t));
+        snapshot_ctx_t *snapshot_ctx = (snapshot_ctx_t *)funcctx->user_fctx;
+
+        List *qnl = stringToQualifiedNameList(PG_GETARG_CSTRING(0));
+        RangeVar *rv = makeRangeVarFromNameList(qnl);
+        Relation rel = relation_openrv(rv, AccessShareLock);
+		//funcctx->tuple_desc = BlessTupleDesc(CreateTupleDescCopy(RelationGetDescr(rel)));
+
+        Snapshot newsnap = (Snapshot) MemoryContextAlloc(TopTransactionContext, sizeof(SnapshotData));
+        memcpy(newsnap, GetActiveSnapshot(), sizeof(SnapshotData)); // shallow copy, very prone to breakage
+        newsnap->regd_count = 0;
+        newsnap->active_count = 0;
+        newsnap->xmax = PG_GETARG_INT32(1);
+        newsnap->xmin = PG_GETARG_INT32(1);
+
+        snapshot_ctx->scandesc = table_beginscan(rel, newsnap, 0, NULL);
+
+        MemoryContextSwitchTo(oldctx);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    snapshot_ctx_t *snapshot_ctx = (snapshot_ctx_t *)funcctx->user_fctx;
+    TupleTableSlot *slot = MakeTupleTableSlot(snapshot_ctx->scandesc->rs_rd->rd_att, &TTSOpsBufferHeapTuple);
+
+    bool ip = table_scan_getnextslot(snapshot_ctx->scandesc, ForwardScanDirection, slot);
+    if(!ip)
+    {
+        SRF_RETURN_DONE(funcctx);
+    }
+    else
+    {
+        HeapTuple tuple = slot->tts_ops->get_heap_tuple(slot);
+        SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+    }
 }
 
 PG_FUNCTION_INFO_V1(snapshot);
-
-static void
-gprom_ExecutorStart(QueryDesc *queryDesc, int eflags)
-{
-    List *tlist = queryDesc->plannedstmt->planTree->targetlist;
-    ListCell *cell;
-    
-    foreach(cell, tlist) 
-    {
-        TargetEntry *tentr = (TargetEntry*)lfirst(cell);
-        FuncExpr *fexpr = (FuncExpr*)tentr->expr;
-        if(!strcmp(tentr->resname, "snapshot"))
-        {
-            elog(INFO, "%d", fexpr->args->elements)
-            // Set estate snapshot to snapshot desired argument
-        }
-    }
-    
-    // Hand control to prev/standard ExecutorStart
-    if (prev_ExecutorStart)
-        prev_ExecutorStart(queryDesc, eflags);
-    else
-        standard_ExecutorStart(queryDesc, eflags);
-}
 
 /* PG Module Loading/Unloading */
 
 void
 _PG_init(void)
 {
-    prev_ExecutorStart = ExecutorStart_hook;
     prev_ExecutorEnd = ExecutorEnd_hook;
-    ExecutorStart_hook = gprom_ExecutorStart;
     ExecutorEnd_hook = gprom_ExecutorEnd;
 }
 
 void
 _PG_fini(void)
 {
-    if(plan)
-        SPI_freeplan(plan);
-    ExecutorStart_hook = prev_ExecutorStart;
+    if(al_plan)
+        SPI_freeplan(al_plan);
     ExecutorEnd_hook = prev_ExecutorEnd;
 }

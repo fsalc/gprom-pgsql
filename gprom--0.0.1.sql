@@ -1,4 +1,4 @@
-CREATE FUNCTION snapshot(integer)
-    RETURNS integer
+CREATE OR REPLACE FUNCTION snapshot(anyelement, integer)
+    RETURNS SETOF anyelement
     AS 'MODULE_PATHNAME'
     LANGUAGE C STRICT VOLATILE;
